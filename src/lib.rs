@@ -283,134 +283,141 @@ fn split_request_target(target: &str) -> (String, Option<String>, Option<String>
     (path.to_owned(), extension, query_string)
 }
 
+#[derive(Debug, Default)]
+struct ParsedRequest {
+    request: Option<String>,
+    method: Option<String>,
+    request_target: Option<String>,
+    request_path: Option<String>,
+    extension: Option<String>,
+    query_string: Option<String>,
+    protocol: Option<String>,
+}
+
+fn parse_unquoted(lexer: &mut Lexer<'_>, field: &str) -> Result<String, ParseError> {
+    let offset = lexer.position;
+    utf8(lexer.unquoted(field)?, field, offset)
+}
+
+fn parse_nullable_quoted(lexer: &mut Lexer<'_>, field: &str) -> Result<Option<String>, ParseError> {
+    let offset = lexer.position.saturating_add(1);
+    let value = utf8(lexer.quoted(field)?.bytes, field, offset)?;
+    Ok(nullable(value))
+}
+
+fn parse_timestamp(lexer: &mut Lexer<'_>) -> Result<String, ParseError> {
+    let offset = lexer.position.saturating_add(1);
+    let timestamp = utf8(lexer.bracketed("timestamp")?, "timestamp", offset)?;
+    normalize_timestamp(&timestamp, offset)
+}
+
+fn parse_request(lexer: &mut Lexer<'_>) -> Result<ParsedRequest, ParseError> {
+    let offset = lexer.position.saturating_add(1);
+    let value = lexer.quoted("request")?;
+    let request = utf8(value.bytes, "request", offset)?;
+    if request == "-" {
+        return Ok(ParsedRequest::default());
+    }
+    if value.literal_spaces.len() != 2 {
+        return Err(ParseError::new(
+            offset,
+            "request must contain method, target, and protocol",
+        ));
+    }
+
+    let first = value.literal_spaces[0];
+    let second = value.literal_spaces[1];
+    if first == 0 || second == first.saturating_add(1) || second.saturating_add(1) >= request.len()
+    {
+        return Err(ParseError::new(
+            offset,
+            "request method, target, and protocol must be non-empty",
+        ));
+    }
+
+    let method = request[..first].to_owned();
+    let request_target = request[first.saturating_add(1)..second].to_owned();
+    let protocol = request[second.saturating_add(1)..].to_owned();
+    let (request_path, extension, query_string) = split_request_target(&request_target);
+    Ok(ParsedRequest {
+        request: Some(request),
+        method: Some(method),
+        request_target: Some(request_target),
+        request_path: Some(request_path),
+        extension,
+        query_string,
+        protocol: Some(protocol),
+    })
+}
+
+fn parse_status(lexer: &mut Lexer<'_>) -> Result<u16, ParseError> {
+    let offset = lexer.position;
+    let status = parse_unquoted(lexer, "status")?;
+    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseError::new(offset, "status must be three digits"));
+    }
+    status
+        .parse()
+        .map_err(|_| ParseError::new(offset, "status is out of range"))
+}
+
+fn parse_bytes_sent(lexer: &mut Lexer<'_>) -> Result<Option<u64>, ParseError> {
+    let offset = lexer.position;
+    let bytes = parse_unquoted(lexer, "bytes sent")?;
+    if bytes == "-" {
+        return Ok(None);
+    }
+    if bytes.is_empty() || !bytes.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseError::new(offset, "bytes sent must be digits or '-'"));
+    }
+    bytes
+        .parse()
+        .map(Some)
+        .map_err(|_| ParseError::new(offset, "bytes sent is out of range"))
+}
+
 pub fn parse_line(line: &[u8]) -> Result<LogRecord, ParseError> {
     let mut lexer = Lexer::new(line);
 
-    let offset = lexer.position;
-    let remote_host = utf8(lexer.unquoted("remote host")?, "remote host", offset)?;
+    let remote_host = parse_unquoted(&mut lexer, "remote host")?;
     lexer.separator()?;
 
-    let offset = lexer.position;
-    let ident = nullable(utf8(lexer.unquoted("ident")?, "ident", offset)?);
+    let ident = nullable(parse_unquoted(&mut lexer, "ident")?);
     lexer.separator()?;
 
-    let offset = lexer.position;
-    let remote_user = nullable(utf8(lexer.unquoted("remote user")?, "remote user", offset)?);
+    let remote_user = nullable(parse_unquoted(&mut lexer, "remote user")?);
     lexer.separator()?;
 
-    let offset = lexer.position;
-    let timestamp = utf8(
-        lexer.bracketed("timestamp")?,
-        "timestamp",
-        offset.saturating_add(1),
-    )?;
-    let timestamp = normalize_timestamp(&timestamp, offset.saturating_add(1))?;
+    let timestamp = parse_timestamp(&mut lexer)?;
     lexer.separator()?;
 
-    let request_offset = lexer.position;
-    let request_value = lexer.quoted("request")?;
-    let request = utf8(
-        request_value.bytes,
-        "request",
-        request_offset.saturating_add(1),
-    )?;
+    let request = parse_request(&mut lexer)?;
     lexer.separator()?;
 
-    let status_offset = lexer.position;
-    let status_text = utf8(lexer.unquoted("status")?, "status", status_offset)?;
-    if status_text.len() != 3 || !status_text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ParseError::new(
-            status_offset,
-            "status must be three digits",
-        ));
-    }
-    let status = status_text
-        .parse()
-        .map_err(|_| ParseError::new(status_offset, "status is out of range"))?;
+    let status = parse_status(&mut lexer)?;
     lexer.separator()?;
 
-    let bytes_offset = lexer.position;
-    let bytes_text = utf8(lexer.unquoted("bytes sent")?, "bytes sent", bytes_offset)?;
-    let bytes_sent = if bytes_text == "-" {
-        None
-    } else if !bytes_text.is_empty() && bytes_text.bytes().all(|byte| byte.is_ascii_digit()) {
-        Some(
-            bytes_text
-                .parse()
-                .map_err(|_| ParseError::new(bytes_offset, "bytes sent is out of range"))?,
-        )
-    } else {
-        return Err(ParseError::new(
-            bytes_offset,
-            "bytes sent must be digits or '-'",
-        ));
-    };
+    let bytes_sent = parse_bytes_sent(&mut lexer)?;
     lexer.separator()?;
 
-    let referer_offset = lexer.position;
-    let referer = nullable(utf8(
-        lexer.quoted("referer")?.bytes,
-        "referer",
-        referer_offset.saturating_add(1),
-    )?);
+    let referer = parse_nullable_quoted(&mut lexer, "referer")?;
     lexer.separator()?;
 
-    let user_agent_offset = lexer.position;
-    let user_agent = nullable(utf8(
-        lexer.quoted("user agent")?.bytes,
-        "user agent",
-        user_agent_offset.saturating_add(1),
-    )?);
+    let user_agent = parse_nullable_quoted(&mut lexer, "user agent")?;
     lexer.finish()?;
-
-    let (request, method, request_target, request_path, extension, query_string, protocol) =
-        if request == "-" {
-            (None, None, None, None, None, None, None)
-        } else {
-            if request_value.literal_spaces.len() != 2 {
-                return Err(ParseError::new(
-                    request_offset.saturating_add(1),
-                    "request must contain method, target, and protocol",
-                ));
-            }
-            let first = request_value.literal_spaces[0];
-            let second = request_value.literal_spaces[1];
-            if first == 0
-                || second == first.saturating_add(1)
-                || second.saturating_add(1) >= request.len()
-            {
-                return Err(ParseError::new(
-                    request_offset.saturating_add(1),
-                    "request method, target, and protocol must be non-empty",
-                ));
-            }
-            let method = request[..first].to_owned();
-            let request_target = request[first.saturating_add(1)..second].to_owned();
-            let protocol = request[second.saturating_add(1)..].to_owned();
-            let (request_path, extension, query_string) = split_request_target(&request_target);
-            (
-                Some(request),
-                Some(method),
-                Some(request_target),
-                Some(request_path),
-                extension,
-                query_string,
-                Some(protocol),
-            )
-        };
 
     Ok(LogRecord {
         remote_host,
         ident,
         remote_user,
         timestamp,
-        request,
-        method,
-        request_target,
-        request_path,
-        extension,
-        query_string,
-        protocol,
+        request: request.request,
+        method: request.method,
+        request_target: request.request_target,
+        request_path: request.request_path,
+        extension: request.extension,
+        query_string: request.query_string,
+        protocol: request.protocol,
         status,
         bytes_sent,
         referer,
