@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 use tempfile::tempdir;
@@ -117,4 +117,27 @@ fn rejects_using_input_as_output() {
             .unwrap()
             .contains("same file")
     );
+}
+
+#[test]
+fn exits_silently_when_stdout_reader_closes_early() {
+    let directory = tempdir().unwrap();
+    let input = directory.path().join("large.log");
+    fs::write(&input, format!("{FIRST}\n").repeat(5_000)).unwrap();
+    let mut child = binary()
+        .arg(&input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first_line = String::new();
+
+    stdout.read_line(&mut first_line).unwrap();
+    assert_eq!(first_line, HEADER);
+    drop(stdout);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
 }
